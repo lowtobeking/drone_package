@@ -314,11 +314,14 @@ class DiagMonitor(Node):
 
         q = qos_sub()
         for i in range(self.num):
-            self.create_subscription(
-                VehicleLocalPosition,
-                topic_for(i, 'out/vehicle_local_position_v1'),
-                self._make_pos_cb(i), q,
-            )
+            # local_position 话题名随固件版本化：PX4 main → `_v1`；v1.16/v1.14 → 无后缀版。
+            # 下面两个后缀都订阅：哪个存在哪个生效，跨版本通用；v1.16 命中无后缀版。
+            for _lp_t in ('out/vehicle_local_position_v1', 'out/vehicle_local_position'):
+                self.create_subscription(
+                    VehicleLocalPosition,
+                    topic_for(i, _lp_t),
+                    self._make_pos_cb(i), q,
+                )
             # 🔴 PX4 v1.16 起启用**消息版本化**：话题改名为 `vehicle_status_v1`
             #    （消息类型仍是 px4_msgs/msg/VehicleStatus，只有话题名带后缀）。
             #    v1.14 上不存在 _v1、v1.16 上不存在无后缀版 —— 而**订阅错了不会报错，
