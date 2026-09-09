@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Fast-DDS 单播发现 profile —— LQ-MESH 无线组网
+  本机 mesh IP: 192.168.1.100
+  由 deploy/make_mesh_profile.py 生成，请勿手改；要改改生成器里的 PEERS 表。
+  接口白名单: 开启（只在 mesh 网卡 + 回环上通信）
+
+  部署所需的三个环境变量已一并写入同名 .env 文件
+  (systemd 可直接 EnvironmentFile= 它；非交互 shell 不读 .bashrc)。
+  注：此处刻意不写绝对路径 —— XML 注释里不允许出现连续两个连字符，
+  而路径里一旦含有它整份文件就解析不了。
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>mesh_udp</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>192.168.1.100</address>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="mesh_unicast" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>mesh_udp</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+
+        <builtin>
+          <discovery_config>
+            <discoveryProtocol>SIMPLE</discoveryProtocol>
+            <!-- 无线丢包下放宽租约，避免误判邻居掉线 -->
+            <leaseDuration><sec>12</sec></leaseDuration>
+            <leaseAnnouncement><sec>3</sec></leaseAnnouncement>
+          </discovery_config>
+
+          <!-- 本机监听地址：手动指定 metatraffic 单播 locator 会让 Fast-DDS 弃用默认
+               多播 locator = 禁多播（无线多播极不稳，是组网时通时断的头号原因）。 -->
+          <metatrafficUnicastLocatorList>
+            <locator><udpv4><address>192.168.1.100</address></udpv4></locator>
+          </metatrafficUnicastLocatorList>
+
+          <!-- 单播互探名单：全网一致，端口留空 = 自动探测标准 metatraffic 端口。 -->
+          <initialPeersList>
+            <locator><udpv4><address>127.0.0.1</address></udpv4></locator>  <!-- 本机 XRCE Agent -->
+            <locator><udpv4><address>192.168.1.100</address></udpv4></locator>  <!-- 地面 PC / QGC（若在其上跑 ROS2） -->
+            <locator><udpv4><address>192.168.1.101</address></udpv4></locator>  <!-- drone1 = A10 -->
+            <locator><udpv4><address>192.168.1.102</address></udpv4></locator>  <!-- drone2 = A08 -->
+            <locator><udpv4><address>192.168.1.103</address></udpv4></locator>  <!-- drone3（预留） -->
+          </initialPeersList>
+        </builtin>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

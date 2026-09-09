@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  ⚠️ 2026-08-30 起本文件已被 deploy/make_mesh_profile.py 取代，保留仅作参考/回退。
+     请勿再手改这一份下发到机上——它需要"每台改一行"，正是最容易改错的那种配置；
+     而且它没有接口白名单，多网卡的 Jetson 上可能出现"发现得到、收不到数据"。
+     正常流程：
+       python3 deploy/make_mesh_profile.py        # 每台机器上各跑一次，自动探测本机 IP
+       python3 tools/check_mesh_dds.py            # 分级预检
+  ============================================================
+  Fast-DDS 单播发现 profile —— 阿木 LQ-MESH 无线组网用
+  ============================================================
+  用途：无线 mesh 上禁用多播发现（无线多播极不稳，是组网时通时断的头号原因），
+        改用 initialPeersList 单播互探。
+  适用：ROS2 Humble / rmw_fastrtps_cpp / ROS_DOMAIN_ID=0
+
+  部署（每台机器）：
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    export ROS_DOMAIN_ID=0
+    export FASTRTPS_DEFAULT_PROFILES_FILE=/绝对路径/mesh_fastdds_profile.xml
+  然后再 ros2 launch / 起节点。systemd 里用 Environment= 显式写这三行
+  （非交互 shell 不读 .bashrc，见 jetson 记忆）。
+
+  ⚠️ 每台机器只改一处：下面 <metatrafficUnicastLocatorList> 里的 address = 本机 mesh IP
+       drone1 (A10) = 192.168.1.101
+       drone2 (A08) = 192.168.1.102
+       drone3        = 192.168.1.103
+       地面 PC       = 192.168.1.100
+
+  🔴 2026-08-19 室外场地实测改编址：机载电脑一律用 .10x，**不要再用 .20x**。
+     LQ 电台自身占用 192.168.1.200 / .202 / .203（三台都开 80+23 web 配置页）。
+     原方案把 drone2/drone3 放在 .202/.203 与电台直接冲突——现场表现为
+     ARP 归属来回翻：同一个 .202 从 A10 解析到 Jetson、从地面 PC 解析到电台，
+     TCP 被电台 RST（"积极拒绝"）。飞行中一旦 A10 的 ARP 翻到电台，
+     机间 DDS 立即断链。已把两台 Jetson 挪到 .101/.102。
+  <initialPeersList> 全网所有机器都一样，不用改。
+  （XRCE Agent 的 systemd 不必加这个 profile：它只服务本机 FC<->mpc_node，
+    靠名单里的 127.0.0.1 被本机 mpc_node 单播发现即可。）
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <participant profile_name="mesh_unicast" is_default_profile="true">
+      <rtps>
+        <builtin>
+          <discovery_config>
+            <discoveryProtocol>SIMPLE</discoveryProtocol>
+            <!-- 无线丢包下把租约放宽一点，避免误判邻居掉线 -->
+            <leaseDuration>
+              <sec>12</sec>
+            </leaseDuration>
+            <leaseAnnouncement>
+              <sec>3</sec>
+            </leaseAnnouncement>
+          </discovery_config>
+
+          <!-- ★ 本机监听地址：只填【本机】mesh IP。
+               手动指定 metatraffic 单播 locator 会让 Fast-DDS 弃用默认多播 locator，
+               = 禁多播 + 把发现流量钉在 mesh 网卡上。 -->
+          <metatrafficUnicastLocatorList>
+            <locator>
+              <udpv4>
+                <address>192.168.1.101</address>   <!-- ← 每台改这一行为本机 mesh IP -->
+              </udpv4>
+            </locator>
+          </metatrafficUnicastLocatorList>
+
+          <!-- 单播互探名单：全网所有 DDS 参与者 + 本机回环(给本机 XRCE Agent)。
+               全网一致，端口留空 = 自动探测各机的标准 metatraffic 端口。 -->
+          <initialPeersList>
+            <locator><udpv4><address>127.0.0.1</address></udpv4></locator>     <!-- 本机 XRCE Agent -->
+            <locator><udpv4><address>192.168.1.100</address></udpv4></locator>  <!-- 地面 PC/QGC(若跑 ROS2) -->
+            <locator><udpv4><address>192.168.1.101</address></udpv4></locator>  <!-- drone1 = A10 -->
+            <locator><udpv4><address>192.168.1.102</address></udpv4></locator>  <!-- drone2 = A08 -->
+            <locator><udpv4><address>192.168.1.103</address></udpv4></locator>  <!-- drone3(预留) -->
+          </initialPeersList>
+        </builtin>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

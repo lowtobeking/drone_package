@@ -1,0 +1,28 @@
+diff --git a/ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500 b/ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500
+index bb6bedd386..ef1ae09458 100644
+--- a/ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500
++++ b/ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500
+@@ -17,6 +17,11 @@ param set-default SENS_EN_GPSSIM 1
+ param set-default SENS_EN_BAROSIM 0
+ param set-default SENS_EN_MAGSIM 1
+ 
++# Multi-SITL: keep sim battery full so it never goes "unhealthy" during long runs.
++# Default SIM_BAT_DRAIN=60 drains to SIM_BAT_MIN_PCT=50% in 60s → low-batt warning /
++# "Battery unhealthy" preflight fail blocks re-arm. Pin to 100% (no drain).
++param set-default SIM_BAT_MIN_PCT 100
++
+ param set-default CA_AIRFRAME 0
+ param set-default CA_ROTOR_COUNT 4
+ 
+@@ -52,3 +57,11 @@ param set-default SIM_GZ_EC_MAX3 1000
+ param set-default SIM_GZ_EC_MAX4 1000
+ 
+ param set-default MPC_THR_HOVER 0.60
++
++# Hold mode on offboard loss — drone hovers autonomously instead of landing
++param set-default COM_OBL_RC_ACT 5
++
++# Disable 10s auto-preflight-disarm: takeoff has intermittent offboard setpoint
++# dropouts that bounce nav OFFBOARD<->Hold on the ground; the default 10s guillotine
++# (COM_DISARM_PRFLT) disarms before the drone can climb out. 0 = never auto-disarm.
++param set-default COM_DISARM_PRFLT 0

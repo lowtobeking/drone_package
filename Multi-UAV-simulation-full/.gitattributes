@@ -1,0 +1,20 @@
+# Python 和 Markdown：统一 LF
+*.py    text eol=lf
+*.md    text eol=lf
+
+# Shell 脚本：强制 LF（Ubuntu bash 不接受 CRLF）
+*.sh    text eol=lf
+
+# systemd unit：强制 LF（CRLF 会让 systemd 把 \r 当成值的一部分，解析异常）
+*.service text eol=lf
+
+# Launch 文件
+*.yaml  text eol=lf
+*.json  text eol=lf
+
+# 二进制：禁止行尾转换与文本化 diff/merge（避免 .slx/.mp4 等被误处理）
+*.slx   binary
+*.slxc  binary
+*.mp4   binary
+*.pdf   binary
+*.png   binary

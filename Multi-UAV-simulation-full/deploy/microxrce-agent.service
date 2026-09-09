@@ -1,0 +1,33 @@
+[Unit]
+Description=MicroXRCE-DDS Agent (PX4 uXRCE-DDS bridge over Ethernet UDP 8888)
+Documentation=https://github.com/Aaron6099/Multi-UAV-simulation
+After=network-online.target
+Wants=network-online.target
+# FC 未上电 / 网络未就绪时会反复失败退出，这里关掉重启次数限制，
+# 否则 systemd 会在若干次失败后把服务拉黑不再重试（飞场先开 Jetson 后开 FC 就会中招）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=nvidia
+# ⚠️ 非交互启动不读 ~/.bashrc —— 环境变量必须在这里显式给全。
+# 漏掉 ROS_DOMAIN_ID 会【静默】用错域：Agent 正常起、实体全建、日志零报错，
+# 但 ROS2 侧一个 /fmu/ 话题都看不见（2026-07-21 在域号 42 上踩过整轮）。
+# 域号两侧都要对：FC 侧由参数 UXRCE_DDS_DOM_ID 决定。
+# **2026-07-23 起改为 0**（飞场固定要求；FC 侧实读 UXRCE_DDS_DOM_ID=0 已一致）。
+Environment=ROS_DOMAIN_ID=0
+# ⚠️ 必须 fastrtps：MicroXRCEAgent 基于 Fast-DDS 编译，与 CycloneDDS 不互通
+# （实测同条件 fastrtps=有话题 / cyclonedds=0 话题，且零报错）。
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# 2026-07-23：传输方式由串口改以太网。
+#   FC 侧 UXRCE_DDS_CFG=1000(Ethernet) / UXRCE_DDS_AG_IP=10.41.10.100 / PRT=8888
+#   FC 以太网地址 10.41.10.2（SD 卡 net.cfg 预置飞场网段），Orin NX 侧 eno1=10.41.10.100
+# ⚠️ 旧的串口方式（serial --dev /dev/ttyTHS1 -b 921600）已作废：X6 Air+ 没有
+#   TELEM2，companion 链路设计上就走以太网；TELEM1 要留给 3DR 数传。
+ExecStart=/usr/local/bin/MicroXRCEAgent udp4 -p 8888
+Restart=always
+RestartSec=2
+# 日志走 journald（User=nvidia 写 /var/log 没权限）：journalctl -u microxrce-agent -f
+
+[Install]
+WantedBy=multi-user.target

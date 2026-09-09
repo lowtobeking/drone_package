@@ -1,0 +1,60 @@
+# Flocking swarm configuration
+# All distances in meters, all angles in radians, NED frame
+
+swarm:
+  num_drones: 9
+
+  # Birth positions in WORLD NED frame (north, east, down)
+  # MUST match the PX4_GZ_MODEL_POSE used to spawn each drone
+  # PX4_GZ_MODEL_POSE is given in ENU as "x,y" = (east, north)
+  # So drone i started with PX4_GZ_MODEL_POSE="east,north" has world NED birth (north, east, 0)
+  birth_positions:
+    # drone_id: [north, east, down]
+    0: [0.0, 0.0, 0.0]      # center
+    1: [0.0, 3.0, 0.0]      # east
+    2: [0.0, -3.0, 0.0]     # west
+    3: [3.0, 0.0, 0.0]      # north
+    4: [3.0, 3.0, 0.0]      # NE
+    5: [3.0, -3.0, 0.0]     # NW
+    6: [-3.0, 0.0, 0.0]     # south
+    7: [-3.0, 3.0, 0.0]     # SE
+    8: [-3.0, -3.0, 0.0]    # SW
+
+  # Flocking parameters (analogous to MATLAB c_f, c_n, c_o, dist, range)
+  flocking:
+    range: 20.0        # Neighbour sensing radius (m). MATLAB used 500 for V=25 fixed-wing; here 20 fits x500 multirotor.
+    desired_dist: 4.0  # Desired inter-UAV distance (m). MATLAB used 50.
+    target_alt: -5.0   # Target altitude in NED (negative = up). MATLAB used 100m, here -5m for safe SITL.
+
+    # Force gains
+    c_pos: 0.5         # Inter-UAV position consensus (was c2 in MATLAB)
+    c_vel: 1.0         # Inter-UAV velocity consensus (was c1_1)
+    c_yaw: 0.5         # Inter-UAV heading consensus (was c1_2)
+    c_lead_pos: 0.3    # Leader position attraction (was c5)
+    c_lead_vel: 1.0    # Leader velocity matching (was c4_1)
+    c_lead_yaw: 0.5    # Leader heading matching (was c4_2)
+
+    # Output limits (to keep PX4 happy)
+    max_speed: 5.0     # m/s, horizontal speed cap
+    max_climb: 1.5     # m/s, vertical speed cap
+
+    # Control rate
+    control_hz: 20.0
+
+  # Virtual leader trajectory (rectangular path in WORLD NED)
+  leader:
+    speed: 2.0         # m/s
+    altitude: -5.0     # NED, negative = up
+    # 4 corners of the rectangle, [north, east]
+    # 50m x 50m square centered around origin
+    waypoints:
+      - [0.0, 0.0]
+      - [0.0, 50.0]
+      - [50.0, 50.0]
+      - [50.0, 0.0]
+    publish_hz: 20.0
+
+  # Arming
+  arming:
+    takeoff_alt: -5.0  # NED altitude before flocking starts
+    setup_seconds: 8.0 # wait this long after each drone is armed before sending offboard mode

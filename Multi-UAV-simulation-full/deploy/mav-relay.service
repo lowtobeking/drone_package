@@ -1,0 +1,34 @@
+[Unit]
+Description=MAVLink UDP relay (FC ethernet <-> ground station over LQ-MESH)
+Documentation=https://github.com/Aaron6099/Multi-UAV-simulation
+After=network-online.target
+Wants=network-online.target
+# FC 未上电 / mesh 未就绪时会失败退出。关掉重启次数限制，否则 systemd 会在若干次
+# 失败后把服务拉黑不再重试（现场"先开 Jetson 后开 FC"就会中招）——与 microxrce-agent 同理。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=nvidia
+
+# ⚠️ 非交互启动不读 ~/.bashrc（Ubuntu 默认 .bashrc 开头有"非交互式提前 return"）
+#    —— 所以这里不能依赖任何 shell 环境，路径与变量都要显式给全。
+#    本脚本只用标准库 + socket，不需要 ROS/acados 环境。
+
+# 🔴 **逐台不同，装之前必须改这一行**：飞控的以太网地址
+#      A10 = 10.41.10.2      （eno1 = 10.41.10.100）
+#      A08 = 192.168.77.2    （eno1 = 192.168.77.100）
+#    写错**不报错、只是静默无数据**（2026-08-19 现场踩过）。
+Environment=MAV_RELAY_FC=10.41.10.2
+
+# 地面站 IP。桥会自动学习"最后一个发 MAVLink 来的地面站"，但**自动学习无法自举**：
+# QGC 的 UDP 链路只监听、从不主动呼叫，必须先由本桥把飞控数据发到正确地址，
+# QGC 才会回包。所以这个默认值要给对。地面 PC 挂在 LQ 地面端上时通常是 192.168.1.123。
+ExecStart=/usr/bin/python3 /home/nvidia/Multi-UAV-simulation/tools/mav_relay.py 192.168.1.123
+
+Restart=always
+RestartSec=3
+# 日志走 journald：journalctl -u mav-relay -f
+
+[Install]
+WantedBy=multi-user.target

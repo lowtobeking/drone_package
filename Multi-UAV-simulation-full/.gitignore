@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ROS2 / colcon build artifacts
+build/
+install/
+log/
+
+# acados generated code & cache
+acados_*/
+c_generated_code/
+*.json.bak
+
+# Editor / OS
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 个人/工作文档（保留在本地桌面，不入库）
+*.docx
+
+# Simulink build cache（slprj 在任意子目录都忽略，含 mpc_port/slprj）
+report/simulink_formation/**/slprj/
+*.slxc
+
+# swarm_distributed.slx 的旁路缓存标记（记录当前文件对应哪个 formation/n，
+# build_distributed_swarm_model.m 自动重建判据，属可重建缓存不入库）
+report/simulink_formation/mpc_port/swarm_distributed.cfg.mat
+
+# Claude Code local (per-machine) settings — platform-specific hooks live here, not in git
+.claude/settings.local.json

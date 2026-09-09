@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- MicroXRCEAgent 专用 FastDDS 配置：DDS 锁定 127.0.0.1，禁用 SHM 传输。
+
+     根因（2026-07-27）：USB 直连 Orin NX / 实验室 WiFi 网卡 → FastDDS 默认向所有网卡撒组播发现，
+     外部网卡上的 DDS 参与者把 Agent 的 timesync 线程拖到 RTT 1000ms+ → 全员 ping 超时断连。
+
+     修复：仅用 127.0.0.1 白名单的 UDP 传输隔离外部网卡，同时去掉 SHM（自编译 Agent 与 apt 装的
+     ROS Fast-DDS 版本不同，SHM 段格式可能不兼容）。保留 Fast-DDS 默认的组播 PDP 发现——
+     loopback 组播在本机实测可用（/proc/net/igmp 已有 239.255.0.1 成员，socket 现场 join 成功），
+     不需要禁组播/强制单播 initialPeers（2026-07-28 曾误诊 "lo 不支持组播" 并加过这段，
+     实测该修改反而导致 ros2 topic list 完全看不到任何 fmu 话题，已回退）。
+     与 ROS_LOCALHOST_ONLY=1 的 ROS2 节点兼容。
+
+     用法（见 /ubuntu-deploy skill 终端2）：
+       FASTRTPS_DEFAULT_PROFILES_FILE=~/ros2_control_mpc_ws/src/mpc_control/config/agent_localhost.xml MicroXRCEAgent udp4 -p 8888
+     注意：真机联调（笔记本↔机载电脑跨机 DDS）时不要用本配置。 -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_localhost</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList>
+        <address>127.0.0.1</address>
+      </interfaceWhiteList>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="default_localhost" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports>
+        <transport_id>udp_localhost</transport_id>
+      </userTransports>
+    </rtps>
+  </participant>
+</profiles>

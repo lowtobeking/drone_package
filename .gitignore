@@ -1,0 +1,40 @@
+# ==== 大目录 / 不纳入正文的大第三方树或历史快照 ====
+# (以下作为本仓库"正文"均不做版本跟踪；需要的部分用 submodule 或 README 说明)
+
+# 已弃用的 PX4 main 树 — 不含进仓库(文档注明勿默认用)
+PX4-Autopilot/
+
+# 固件树(建议 submodule 而非正文含历史) — 这里显式排除整棵，若用 submodule 会单独 add
+PX4-Autopilot-1.16/
+ros2_ws_real/
+
+# 交接/历史/日志等大件
+handoff/
+flights/
+px4_logs/
+Documents/
+*.tar.gz
+*.tgz
+*.bundle
+
+# 编译运行产物
+build/
+install/
+log/
+
+# MPC / python 缓存
+__pycache__/
+*.pyc
+.acados_cache/
+acados_di_mpc*/
+
+# 编辑器/OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# git / 上游残留
+*.bak
+*.bak-main
+*.bak-1.14

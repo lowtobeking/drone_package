@@ -1,0 +1,747 @@
+# ============================================================================
+# scenarios.yaml — 多工况稳定性测试的【单一真值源】 / single source of truth
+# ----------------------------------------------------------------------------
+# 谁读它:
+#   tools/gen_spawn.py            → 生成 start_N_px4.sh 的 PX4 出生 POSES(ENU)
+#   launch/swarm_launch.py (P1后续) → BIRTH_*/OFFSETS_*/NBR_*/COMMON 由此注入
+#   tools/verdict.py (P3)          → 用 thresholds 自动判 PASS/FAIL
+#
+# 坐标: birth / offsets 一律 世界系 NED = [North, East, Down]（Down 通常 0）。
+#       Gazebo ENU 换算只在 gen_spawn 里做一次: ENU=(East,North)=(NED[1],NED[0])。
+#
+# ⚠️ 改了 formations.*.birth 后，务必重生成 start_N 出生点，别手改脚本：
+#       py tools/gen_spawn.py --formation cross5         # 看/贴 POSES
+#       py tools/gen_spawn.py --validate                 # 校验与现有脚本一致
+# ============================================================================
+
+# ── 公共参数（= swarm_launch.py 的 COMMON）；scenario.limits 可覆盖安全相关项 ──
+defaults:
+  target_alt:               -5.0    # NED，负=向上，-5 → 离地 5 m
+  px4_version:             '1.16'  # 目标固件：'main'|'1.16'|'1.14' —— 决定 topic 是否带版本后缀
+  max_speed:                 3.0
+  max_climb:                 1.5
+  max_accel:                 4.0
+  control_hz:               50.0
+  neighbour_timeout:         2.0
+  startup_zero_vel_frames:   100
+  calib_settle_frames:        25
+  mpc_horizon:                30
+  mpc_dt:                   0.05
+  q_pos:                     4.0
+  q_vel:                     2.0
+  r_acc:                     0.1
+  q_pos_terminal_scale:      2.0
+  # 接口一致 MPC（§5.G/§5.H）：v̇=(v_sp−v)/τ、直接下发 u0。2026-07-14 转正：
+  # 复归 40/41 有效通过（唯一例外 S15 为评测口径问题）。<=0 退回 legacy 双积分
+  #（历史 A/B 基线 S34/S35 已显式钉 0.0）。改此值换 OCP 生成码（缓存目录自带 tag）。
+  vel_lag_tau:               0.5
+  d_safe:                    1.5
+  w_collision:             200.0
+  w_formation:               0.5
+  vel_xy_kp:                 0.0    # 候选①：XY 位置反馈增益。0=纯前馈(现状)；>0 开有界 P 防发散
+  vel_xy_cap:                0.8    # 位置纠偏限幅 m/s，防无阻尼圆周震荡
+  # SITL 三机同一 Gazebo 地面：关闭 alt 跨机校准。各机 EKF 的 ref_alt(GPS海拔基准)
+  # 差 1-1.5m 纯属仿真噪声，非真实高度差；开着会让各机飞到不同物理高度(高度参差)。
+  # 关闭后各机 world_birth_z=birth_z=0，各自控到离地 target_alt，三机同高。
+  # （真机各机 home 海拔可能真不同，部署时再设 true）
+  alt_sync_enable:          false
+  alt_resync_enable:        false
+  # 持久缓存路径（勿改回 /tmp）：Jetson 的 systemd-tmpfiles 配置为 `D /tmp`，
+  # 每次开机清空 /tmp → 台架预编译的 OCP 生成码撑不过一次断电，飞场每次上电都要
+  # 现编数分钟（且每个 drone_id×邻居数组合各一份）。放在 home 下可跨重启命中缓存。
+  # mpc_node 会做 expanduser，故此处可用 ~。改 MPC 结构后仍需清缓存（见 CLAUDE.md）。
+  acados_build_dir: ~/.cache/mpc_control/acados_di_mpc
+  # ── safety_filter 生产参数（Phase 3 标定 2026-07-06，据干净 circle 实测回填）──
+  # track 峰值实测：S32 solo1=3.14 / S33 trio3=3.23 / trio3旧300s=4.01（均为出生→槽位
+  # 收敛暂态；稳态圆周≤1.0）→ 1.5×4.0≈6.0。S14 打乱出生等特殊工况仍用 scenario 覆盖。
+  safety_max_track_dist:     6.0
+  safety_max_alt:            8.0    # 任务高度包络：target_alt=5m → [0.3, 8]
+  safety_min_alt:            0.3
+  # SITL d_safe=1.5 → d_emergency=1.2；真机由 real_hardware_launch conservative 抬到 1.8，
+  # d_warn 自动=max(d_emerg+0.5, d_safe+0.5)（真机=3.0，介于 d_emerg 与实测 min spacing 3.54）。
+  safety_d_emergency:        1.2
+  # relinquish_frames 保持代码默认 50(1s)：S27-S29 无误触发、S30/S31 正确触发、
+  # S31 中 PX4 瞬断 blip 未误 RELINQUISH（2026-07-06 复跑证据）。
+
+# ── 队形几何：标准出生点 birth(NED) + 邻居 + 队形偏移 offsets ──────────────────
+# 取代 swarm_launch.py 里硬编码的 BIRTH_*/OFFSETS_*/NBR_*。offsets 省略 = 同 birth。
+formations:
+  solo1:
+    birth:      [[0, 0, 0]]
+    neighbours: [[0]]
+
+  pair2:                                    # 前后纵列，间距 3 m
+    birth:      [[0, 0, 0], [-3, 0, 0]]
+    neighbours: [[1], [0]]
+
+  # 室内 5×5m 飞场专用：原 pair2 的 offsets 是**偏心**的([0,0] 与 [-3,0]，质心不在
+  # 原点)——起飞点设在场地中心时 drone1 会跑到中心西侧 3m 直接出界；而缩放到不出界
+  # (scale≤0.8)间距就低于真机 d_safe=2.5，靠 offsets_scale 解不开这个矛盾。
+  # 故单独定义**关于原点对称**的室内版：各机距中心 1.4m，间距 2.8m(> d_safe 2.5)，
+  # 占用直径 2.8m，5m 场地每边余 1.1m。
+  pair2_in:                                 # 室内对称纵列，间距 2.8 m
+    birth:      [[1.4, 0, 0], [-1.4, 0, 0]]
+    neighbours: [[1], [0]]
+
+  pair2_out:                                # 室外对称纵列，间距 4 m（2026-08-20 建）
+    # 关于原点对称（与偏心的 pair2 不同）：起飞点设在场地中心时两机各距中心 2m，
+    # leader 轨迹也以场地中心为心，几何最干净。间距 4m > d_safe 2.5m，余量 1.5m。
+    birth:      [[2, 0, 0], [-2, 0, 0]]
+    neighbours: [[1], [0]]
+
+  trio3:                                    # 等边三角形，外接圆 R=3，边长≈5.196
+    birth:      [[3, 0, 0], [-1.5, 2.598, 0], [-1.5, -2.598, 0]]
+    neighbours: [[1, 2], [0, 2], [0, 1]]
+
+  cross5:                                   # 十字：出生即队形
+    birth:      [[0, 0, 0], [0, 3, 0], [0, -3, 0], [3, 0, 0], [-3, 0, 0]]
+    neighbours: [[1, 2, 3, 4], [0], [0], [0], [0]]
+
+  star5:                                    # 出生=十字(同 cross5)，队形=五边形
+    birth:      [[0, 0, 0], [0, 3, 0], [0, -3, 0], [3, 0, 0], [-3, 0, 0]]
+    # offsets 按最近出生点分配槽位，消除收敛路径交叉（旧方案 d2/d3 交叉导致碰撞）:
+    #   d0(0,0)→SW(-2.427,-1.763)  d1(0,3)→NE(0.927,2.853)  d2(0,-3)→NW(0.927,-2.853)
+    #   d3(3,0)→N(3,0) 0m不动       d4(-3,0)→SE(-2.427,1.763)
+    offsets:    [[-2.427, -1.763, 0], [0.927, 2.853, 0], [0.927, -2.853, 0],
+                 [3, 0, 0], [-2.427, 1.763, 0]]
+    # pentagon 环顺序: d3(N)-d1(NE)-d4(SE)-d0(SW)-d2(NW)-d3
+    neighbours: [[4, 2], [3, 4], [0, 3], [1, 2], [1, 0]]
+
+  grid9:                                    # 3×3 方阵：出生即队形
+    birth:      [[0, 0, 0], [0, 3, 0], [0, -3, 0], [3, 0, 0], [-3, 0, 0],
+                 [3, 3, 0], [-3, 3, 0], [3, -3, 0], [-3, -3, 0]]
+    neighbours: [[1, 2, 3, 4], [0, 5, 6], [0, 7, 8], [0, 5, 7], [0, 6, 8],
+                 [1, 3], [1, 4], [2, 3], [2, 4]]
+
+  # ── 规模上限研究（优化③，2026-07-10）：4-连接晶格，间距 3 m，居中于原点 ──────
+  # 邻居 = 正交晶格邻居(von Neumann)，与 grid9 同构。最大度 = 4（内部节点），
+  # 满足「每机 ≤4 邻居」稀疏化约束 → 每机 OCP 规模与 grid9 逐字相同，MPC 状态维度不增长。
+  # ⚠️ 最近**非邻居**对 = 3√2 = 4.243 m（对角），d_safe=1.5。对角对不在任何一机的 OCP
+  #    视野内（碰撞代价只对邻居生效）→ 判定 min_spacing 必须全对枚举，勿只取邻居边。
+  # 目前仅用于 Simulink 分布式规模研究；SITL 未验证（缺 start_16/25_px4.sh，且 16/25 个
+  # PX4+Gazebo 实例的仿真机资源未评估）。真机不适用。
+  grid16:                                   # 4×4 方阵（行序），N,E ∈ {±1.5, ±4.5}，跨度 9×9 m
+    birth:      [[-4.5, -4.5, 0], [-4.5, -1.5, 0], [-4.5, 1.5, 0], [-4.5, 4.5, 0],
+                 [-1.5, -4.5, 0], [-1.5, -1.5, 0], [-1.5, 1.5, 0], [-1.5, 4.5, 0],
+                 [1.5, -4.5, 0], [1.5, -1.5, 0], [1.5, 1.5, 0], [1.5, 4.5, 0],
+                 [4.5, -4.5, 0], [4.5, -1.5, 0], [4.5, 1.5, 0], [4.5, 4.5, 0]]
+    neighbours: [[1, 4], [0, 2, 5], [1, 3, 6], [2, 7],
+                 [0, 5, 8], [1, 4, 6, 9], [2, 5, 7, 10], [3, 6, 11],
+                 [4, 9, 12], [5, 8, 10, 13], [6, 9, 11, 14], [7, 10, 15],
+                 [8, 13], [9, 12, 14], [10, 13, 15], [11, 14]]
+
+  grid25:                                   # 5×5 方阵（同心环序），N,E ∈ {0, ±3, ±6}，跨度 12×12 m
+    # ★ 前 9 机与 grid9 逐点一致（同心序刻意为之）→ 规模对比 = 「同一批机 + 外圈 16 机」，
+    #   grid9 ⊂ grid25，可直接比对同一架机在两种规模下的表现。drone0 仍在几何中心
+    #   （与 cross5/star5/grid9 一致；swarm_launch 的 alt_resync 以 drone0 为 ref_alt 基准）。
+    birth:      [[0, 0, 0], [0, 3, 0], [0, -3, 0], [3, 0, 0], [-3, 0, 0],
+                 [3, 3, 0], [-3, 3, 0], [3, -3, 0], [-3, -3, 0],
+                 [0, 6, 0], [0, -6, 0], [6, 0, 0], [-6, 0, 0],
+                 [3, 6, 0], [6, 3, 0], [6, 6, 0], [-6, 3, 0], [-6, 6, 0], [-3, 6, 0],
+                 [3, -6, 0], [6, -6, 0], [6, -3, 0], [-6, -6, 0], [-6, -3, 0], [-3, -6, 0]]
+    neighbours: [[1, 2, 3, 4], [0, 5, 6, 9], [0, 7, 8, 10], [0, 5, 7, 11], [0, 6, 8, 12],
+                 [1, 3, 13, 14], [1, 4, 16, 18], [2, 3, 19, 21], [2, 4, 23, 24],
+                 [1, 13, 18], [2, 19, 24], [3, 14, 21], [4, 16, 23],
+                 [5, 9, 15], [5, 11, 15], [13, 14], [6, 12, 17], [16, 18], [6, 9, 17],
+                 [7, 10, 20], [19, 21], [7, 11, 20], [23, 24], [8, 12, 22], [8, 10, 22]]
+
+# ── 命名测试工况：选 formation + 覆盖旋钮。对应报告 RUN_PLAN 的 S1–S14 ─────────
+# 可覆盖项：
+#   leader:  {mode: hover|line|circle, speed, radius, max_distance, yaw_mode: fixed|center|tangent}
+#   limits:  {max_speed, max_accel, d_safe, neighbour_timeout}   # 保守限幅 + 阈值调参
+#   faults:  {kill_drone, kill_at_s, comms_delay_ms, comms_dropout}  # 故障注入(P2)
+#   birth_override: [[N,E,D],...]    # 扰动出生(需 gen_spawn 重生成 spawn)
+#   offsets_scale:  <float>          # 整体缩放队形(改间距/尺度)
+#   duration_s:     <int>            # 建议运行时长
+#   thresholds:     {...}            # 覆盖默认判定阈值
+scenarios:
+  # ── CORE（建议必跑，支撑报告主体）──
+  # ══ IN_* 室内飞场场景（2026-07-22 建；2026-07-30 按更正后场地尺寸重算轨迹）══════════
+  # 飞场：**7×8.5 m 水平**、净空约 10 m、动捕定位（VRPN）。短边 7m ⇒ 距中心可用半径 3.5m。
+  #   （下方"取值依据"是旧注释，按 5×5m 假设写的，其中 2.5m/2.0m/4m 均为旧值；轨迹已按新尺寸放大。）
+  # 【2026-07-30 重算】规划包络 = 离场地中心最远位移 ≤ 3.0m（短边半宽 3.5 − 0.5 墙余量）：
+  #   solo1: circle radius 0.8→1.2(位移 2.4m)/line 1.5→2.2；pair2_in: line 1.0→1.4(worst 2.8m)
+  #   + 新增 circle radius 0.6(worst 2.6m)；trio3: line 0.8→1.2(worst 2.7m)。速度小幅上调仍 ≤0.5。
+  # ⚠️⚠️ 放大轨迹的两个前置（必须一起满足，否则飞不起来/撞围栏/丢定位）：
+  #   1) FC 围栏相对各机 home：已把 `fc_configure.py` geofence 组 **GF_MAX_HOR_DIST 2.0→3.0** 同步放开
+  #      （否则单机圆周离 home 2×1.2=2.4m 直接撞围栏）。执行 fc_configure -g geofence --apply 才生效。
+  #   2) **动捕标定体积常 < 场地物理尺寸**！本表按 7×8.5m 物理尺寸算，到飞场**先量 FZMotion 实际覆盖**，
+  #      若标定体积 < 3.0m 半径，所有 IN_* 轨迹按标定体积再缩，别照本表直接放飞。
+  # ⚠️ 上面那批 S* 场景全是**室外尺度**（target_alt=-5 即 5m 高、radius=10 即直径
+  #    20m、max_distance=20），室内**直接跑会撞墙**，勿照搬。
+  # 三层约束必须一起对上（缺一层就会飞不起来或中途被拦）：
+  #    leader_radius/target_alt  <  safety_max_alt / safety_max_track_dist
+  #                              <  FC 围栏 GF_MAX_HOR_DIST / GF_MAX_VER_DIST
+  # 取值依据：
+  #  · target_alt=-1.2 —— 飞场 demo 用 0.8m，这里留一点余量；净空 10m 完全不是约束
+  #  · safety_max_track_dist=1.5 —— **必须从默认 6.0 调小**：6m 偏差在 5×5 场地里
+  #    就是撞墙。默认值是室外标定的(实测峰值 3.14~4.01 → ×1.5≈6.0)，室内低速
+  #    (0.3~0.5m/s)暂态偏差远小于此。
+  #  · 速度 0.3~0.5 m/s —— 室内首飞，远低于 conservative 上限 1.5
+  #  · leader_radius=0.8 —— ⚠️ **不是"场地半径减边距"**（2026-07-22 原注释这么写，
+  #    是错的，2026-07-23 SITL 实测更正）：`leader_node.py:232` 是
+  #    `cx = x0 - radius`，**圆心偏置在起飞点旁边**、起飞点落在圆周上（有意设计，
+  #    避免 t=0 位置阶跃），因此**离起飞点最远处是 2×radius**。
+  #    配 1.5 时实测最大水平位移 3.005m —— 超场地(2.5)也超围栏(GF_MAX_HOR_DIST=2.0)。
+  #    取 0.8 ⇒ 2×0.8=1.6，离围栏留 0.4m 余量。
+  #  · line 的 max_distance=1.5 —— line 模式无上述倍增（距离 0→max_distance 单调），
+  #    但原值 2.0 正好顶在围栏上、零余量。
+  # ⚠️ PX4 围栏是**相对各机自己的 home/起飞点**，不是场地中心；而"撞墙"约束是
+  #    相对场地中心。多机场景两者要分别核：pair2_in 各机距中心 1.4m，叠加 line
+  #    行程 1.0m ⇒ 距中心 2.4m，已贴近 2.5m 墙。
+  # ⚠️ 待确认后可能需要再收紧：**动捕标定体积通常小于场地尺寸**，实际可飞范围
+  #    以标定体积为准；另需按机架轴距复核 d_safe。
+  #    详见 `docs/SITL动捕注入.md` §5.2 的全场景对照表。
+  IN_solo1_hover:
+    formation: solo1
+    leader: {mode: hover}
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.5, max_speed: 0.5, max_climb: 0.5}
+
+  IN_solo1_line:
+    formation: solo1
+    leader: {mode: line, speed: 0.4, max_distance: 2.2, yaw_mode: tangent}   # 7×8.5m:位移2.2m
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.5, max_speed: 0.5, max_climb: 0.5}
+
+  IN_solo1_circle:
+    formation: solo1
+    leader: {mode: circle, speed: 0.5, radius: 1.2, yaw_mode: center}   # 7×8.5m:2×1.2=位移2.4m
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.5, max_speed: 0.5, max_climb: 0.5}
+
+  # ── 室内 pair2（用对称的 pair2_in 队形，间距 2.8m > d_safe 2.5）──────────────
+  IN_pair2_hover:
+    formation: pair2_in
+    leader: {mode: hover, ready_hold: 10.0, ready_pos_err: 0.3}
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.2, max_speed: 0.4, max_climb: 0.4}
+
+  IN_pair2_line:                            # 各机距中心 1.4m + 行程 1.4m = worst 2.8m < 3.5m 半宽
+    formation: pair2_in
+    leader: {mode: line, speed: 0.3, max_distance: 1.4, yaw_mode: fixed,
+             ready_hold: 10.0, ready_pos_err: 0.3}
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.2, max_speed: 0.4, max_climb: 0.4}
+
+  IN_pair2_circle:                          # 7×8.5m 新腾出：各机距中心 1.4m + 2×0.6 = worst 2.6m
+    formation: pair2_in
+    leader: {mode: circle, speed: 0.3, radius: 0.6, yaw_mode: center,
+             ready_hold: 10.0, ready_pos_err: 0.3}
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.2, max_speed: 0.4, max_climb: 0.4}
+
+  # ── 室内 trio3（offsets_scale 0.5 → 边长 2.60m > d_safe 2.5，外接半径 1.5m）────────
+  # 圆周：外接半径 1.5m，7×8.5m 场地(包络 3.0m) ⇒ leader_radius 上限 (3.0−1.5)/2 = 0.75m，
+  #    幅度仍偏小；如需可加 IN_trio3_circle radius≤0.7，本次暂只配 hover / line。
+  IN_trio3_hover:
+    formation: trio3
+    offsets_scale: 0.5
+    birth_override: [[1.5, 0, 0], [-0.75, 1.299, 0], [-0.75, -1.299, 0]]
+    leader: {mode: hover, ready_hold: 10.0, ready_pos_err: 0.3}
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.0, max_speed: 0.4, max_climb: 0.4}
+
+  IN_trio3_line:                            # 各机距中心 1.5m + 行程 1.2m = worst 2.7m < 3.5m 半宽
+    formation: trio3
+    offsets_scale: 0.5
+    birth_override: [[1.5, 0, 0], [-0.75, 1.299, 0], [-0.75, -1.299, 0]]
+    leader: {mode: line, speed: 0.3, max_distance: 1.2, yaw_mode: fixed,
+             ready_hold: 10.0, ready_pos_err: 0.3}
+    limits: {target_alt: -1.2, safety_max_alt: 2.5, safety_min_alt: 0.3,
+             safety_max_track_dist: 1.0, max_speed: 0.4, max_climb: 0.4}
+
+  # ══ 室外单机 OUT_solo1_*（2026-08-19 建，场地半径 15m，RTK/GPS 定位）══════════════
+  # 🔴 别用 IN_* 到室外：`target_alt=-1.2m` 在室内安全，室外反而更危险
+  #    ①离地 1.2m 处于强地效区 ②出问题没有恢复高度(不足 1 秒触地) ③地面不平/有草木。
+  #
+  # 安全分层（**顺序不能反**：companion 正常管，飞控围栏兜底，围栏再留场地余量）：
+  #    场地半径 15m
+  #      └ 飞控 GF_MAX_HOR_DIST = 12m        ← 留 3m 反应余量（相对 home/起飞点）
+  #          └ 轨迹最远离原点 4~5m
+  #              └ 最坏 = 轨迹 5 + 跟踪误差 3 = 8m < 12m ✅
+  #    ⚠️ `safety_max_track_dist` 限的是 |pos − ref|（**偏离参考点**，不是距出生点），
+  #       与围栏是两个量纲，不能直接相加比较；上面的"最坏"才是二者叠加的实际包络。
+  #
+  # `target_alt=-3.0`（2026-08-20 由 −4.0 改）：首飞实测 4m 偏高。3m 仍远离地效
+  #    （地效约在 1 个桨径内），离 `safety_max_alt=8.0` 也仍有 5m 余量。
+  #    ⚠️ 改这个值必须同步 `diag_monitor.py`——它另有一份 target_alt 副本，
+  #       正是那份没跟上才让首飞 CSV 的 `d0_zerr` 整列偏了 1.000m。
+  #
+  # `safety_min_alt=0.3`（2026-08-20 现场由 1.0 改回）：1.0 时飞机停在地面读数
+  #    0.6~1.0m 就持续违规 ⇒ 升级到 RELINQUISH ⇒ 节点停发 setpoint 且每秒重发 Hold，
+  #    表现为「arming denied, change to manual first」、飞手切挡还被拽回。
+  #    起飞爬升仍会穿过该高度，但 safety_filter 有 grace_frames(150帧=3s) 冷启动窗口，
+  #    期间只查碰撞+NaN。
+  #    ⚠️ 首飞实测 grace 窗口**不够长**：从 OFFBOARD 接入到真正爬过 0.3m 花了约 5s
+  #       （地面憋劲 1s + 离地横向蹿动 2s + 爬升），窗口 3s 已过期 ⇒ 触发了一次 DEGRADED
+  #       （垂直指令被削半到 0.4m/s，276.2~278.5s）。无害，但知道是这个原因就别再查了。
+  #
+  # 🔴 三个场景 yaw_mode 一律 fixed：航向来源是 2026-08-18 才恢复、2026-08-19 才标定的
+  #    板载磁罗盘，**尚未在飞行中验证**（§10 A1/A2 未做）。center/tangent 会让飞机主动
+  #    转向，航向一错就把误差直接放大成位置发散。确认航向可信后再放开。
+  OUT_solo1_hover:
+    formation: solo1
+    leader: {mode: hover}
+    limits: {target_alt: -3.0, safety_max_alt: 8.0, safety_min_alt: 0.3,
+             safety_max_track_dist: 3.0, max_speed: 1.0, max_climb: 0.8}
+
+  # 起飞到 3m → 沿**机头方向**前飞 3m → 悬停 → 自动降落（2026-08-21 按需求改）
+  #   飞完 3m 需 4.55s（巡航到 2.95s + 按 line_decel=0.5 减速 1.60s，刹车距离 0.64m）
+  #   mission_duration=15s 从"到达 3m 并稳住 ready_hold"起算 ⇒ 飞完后还悬停约 10s 再降落。
+  # 🔴 line_along_heading: true 是**必须的**——不开则沿世界系 +X(正北)飞，且对准阶段会把
+  #    yaw_mode=fixed 锁成正北（进 OFFBOARD 先原地转向正北，像失控自旋）。见 leader_node。
+  # 🔴 `ready_timeout: 600`（2026-08-21 实飞后加）：该超时**从 leader 节点启动算起**，
+  #    默认 90s。而"起节点 → 飞手手动起飞 → 切 OFFBOARD"这套流程很容易超过 90s ——
+  #    实飞就撞上了：t=90s 飞机还在地上，leader 兜底触发、**直接把直线跑完**并冻结在终点；
+  #    飞手切进 OFFBOARD 时参考已在 3m 外，飞机直奔终点，`poserr` 冲到 3.007 恰好顶满
+  #    `safety_max_track_dist=3.0`（再多一点就 RELINQUISH 交还控制权），而且**根本没走直线**。
+  #    ⇒ 单机手动起飞场景把它拉到 600s，让兜底够不着；正确做法另见流程：**leader 最后起**。
+  OUT_solo1_line:                           # 行程 3m，最坏离原点 3m
+    formation: solo1
+    leader: {mode: line, speed: 0.8, max_distance: 3.0, yaw_mode: fixed,
+             line_along_heading: true, mission_duration: 15.0, ready_timeout: 600.0}
+    limits: {target_alt: -3.0, safety_max_alt: 8.0, safety_min_alt: 0.3,
+             safety_max_track_dist: 3.0, max_speed: 1.0, max_climb: 0.8}
+
+  # 起飞到 3m → 半径 3m 圆周 → 机头朝向全程不变 → 自动降落（2026-08-21 按需求改）
+  #   ω=v/r=0.2667 rad/s，周长 18.85m，一圈纯时长 23.56s；circle_ramp_time=5s 的缓启动
+  #   让相位少走 T/2 ⇒ 走满一整圈需 **26.06s**。
+  #   mission_duration=26.0 ⇒ 相位 359.1°，**正好一圈**（LAND 后还有 land_settle_s=1.5s
+  #   零速稳住，减速中会再多走一点，实际略过 360°）。改 speed/radius/circle_ramp_time
+  #   都会改这个时长，公式：2πr/v + circle_ramp_time/2。
+  #   向心加速度 v²/r = 0.213 m/s²，仍很温和。
+  # 🔑 机头不变靠 yaw_mode: fixed。circle 在 tau=0 时 ω=0（缓启动）⇒ 速度为零 ⇒ 锁的是
+  #    **实测起飞航向**而非正北；若把 circle_ramp_time 设成 0 会退化成锁切向初速方向，别改。
+  OUT_solo1_circle:                         # 半径 3m
+    formation: solo1
+    leader: {mode: circle, speed: 0.8, radius: 3.0, yaw_mode: fixed,
+             mission_duration: 26.0, ready_timeout: 600.0}
+    limits: {target_alt: -3.0, safety_max_alt: 8.0, safety_min_alt: 0.3,
+             safety_max_track_dist: 3.0, max_speed: 1.0, max_climb: 0.8}
+
+  # ══ 室外双机 OUT_pair2_*（2026-08-20 建，formation=pair2_out 间距 4m）════════════
+  # 🔴 `ready_pos_err` 用 1.0 而非室内的 0.3 —— **这条不改编队根本开不动**：
+  #    室内动捕是厘米级，0.3m 门槛合理；室外单点 GPS 的 `eph` 最好也就 1.5m，
+  #    pos_err 永远降不到 0.3 ⇒ leader 的就绪门控一直不通过，只能等 ready_timeout(90s)
+  #    超时兜底才开动 —— 那就等于门控形同虚设。1.0m 在 GPS 噪声之上、又仍有判别力。
+  #    ⚠️ 将来 RTK 稳定 Fixed(厘米级)后应把它收回 0.3，否则门控过松。
+  #
+  # 包络核算（围栏是相对**各机自己的 home**，不是场地中心）：
+  #   · line: 各机沿直线走 max_distance 4m ⇒ 离自家 home 4m，+跟踪误差 3m = 7m < 12m ✅
+  #   · circle: 各机轨迹 = 以**自己出生点**为心、半径 3m 的圆（leader 圆 + 固定队形偏移）
+  #             ⇒ 离自家 home 3m，+跟踪误差 3m = 6m < 12m ✅
+  #   · 离场地中心最远 = 3(圆半径) + 2(队形偏移) = 5m，15m 场地绰绰有余
+  #   · 机间距全程恒为 4m（两机跟同一 leader、偏移固定）> d_safe 2.5m ✅
+  #
+  # 限幅与 OUT_solo1_* 保持一致（max_speed 1.0 / max_climb 0.8），刻意不调慢：
+  #   ① 少一个变量，便于与单机结果对照；② 室外速度上限同时限制**抗风权限**，
+  #      压太低反而在阵风下守不住位置。
+  OUT_pair2_hover:
+    formation: pair2_out
+    leader: {mode: hover, ready_hold: 10.0, ready_pos_err: 1.0}
+    limits: {target_alt: -3.0, safety_max_alt: 8.0, safety_min_alt: 0.3,
+             safety_max_track_dist: 3.0, max_speed: 1.0, max_climb: 0.8}
+
+  OUT_pair2_line:                           # 行程 4m，离自家 home 最远 4m
+    formation: pair2_out
+    leader: {mode: line, speed: 0.6, max_distance: 4.0, yaw_mode: fixed,
+             ready_hold: 10.0, ready_pos_err: 1.0}
+    limits: {target_alt: -3.0, safety_max_alt: 8.0, safety_min_alt: 0.3,
+             safety_max_track_dist: 3.0, max_speed: 1.0, max_climb: 0.8}
+
+  OUT_pair2_circle:                         # 半径 3m，向心加速度 v²/r = 0.12 m/s²
+    formation: pair2_out
+    leader: {mode: circle, speed: 0.6, radius: 3.0, yaw_mode: fixed,
+             ready_hold: 10.0, ready_pos_err: 1.0}
+    limits: {target_alt: -3.0, safety_max_alt: 8.0, safety_min_alt: 0.3,
+             safety_max_track_dist: 3.0, max_speed: 1.0, max_climb: 0.8}
+
+  S0_solo1_hover:   {formation: solo1,  leader: {mode: hover}}
+  # Phase 3 已还原旧放宽 track=15（实测 solo1 circle 峰值 3.14 < 生产值 6.0，无需放宽）
+  S0_solo1_circle:  {formation: solo1,  leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}}
+  S1_solo1_line:    {formation: solo1,  leader: {mode: line,   speed: 1.0, max_distance: 20.0, yaw_mode: tangent}}
+  S2_pair2_line:    {formation: pair2,  leader: {mode: line,   speed: 0.5, max_distance: 20.0}}
+  S2_pair2_hover:   {formation: pair2,  leader: {mode: hover}}
+  S3_trio3_hover:   {formation: trio3,  leader: {mode: hover}}
+  S3_trio3_line:    {formation: trio3,  leader: {mode: line,   speed: 0.5, max_distance: 20.0}}
+  S3_trio3_circle:  {formation: trio3,  leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}}
+  # +ready_hold 缓冲入轨：先静止把队形收敛到 pos_err<0.3 再走圆周，消除起步"边追边成型"畸变
+  # (朴素 S3 实测起步瞬态间距掉 0.58m/3违规)。wf 保持默认 0.5——6-09 扫描确认 wf≤0.1 全失稳，
+  # 唯一稳定点 v1.5 wf0.5。报告 S3 主结果用此版。
+  S3_trio3_circle_rh: {formation: trio3, leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center, ready_hold: 20.0, ready_pos_err: 0.3}}
+  S3_trio3_circle_v2: {formation: trio3, leader: {mode: circle, speed: 2.0, radius: 10.0, yaw_mode: center}}  # 速度应力(wf=默认0.5)，扫描 2x3 网格的角
+  S3_trio3_circle_wf01: {formation: trio3, leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center},
+                          limits: {w_formation: 0.1}}
+  S3_trio3_circle_wf01_v2: {formation: trio3, leader: {mode: circle, speed: 2.0, radius: 10.0, yaw_mode: center},
+                              limits: {w_formation: 0.1}}
+  S3_trio3_circle_wf005: {formation: trio3, leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center},
+                           limits: {w_formation: 0.05}}
+  S3_trio3_circle_wf005_v2: {formation: trio3, leader: {mode: circle, speed: 2.0, radius: 10.0, yaw_mode: center},
+                               limits: {w_formation: 0.05}}
+  S4_cross5_line:   {formation: cross5, leader: {mode: line,   speed: 1.0, max_distance: 20.0, ready_hold: 30.0, ready_pos_err: 0.3}}
+  # 入轨防撞+缓冲：speed 1.5→1.0(减小入轨角加速度)、ready_hold 30s 先成型再走、
+  # w_collision 200→500(碰撞软壁加硬，迫使中心机优先避撞而非保队形)。
+  # 实测入轨 min_spacing 2.87m、0 违规、0 fallback（修复前中心-臂曾掉到 0.03m）。
+  S5_cross5_circle: {formation: cross5, leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}, limits: {w_collision: 500.0}}
+  S6_cross5_hover:  {formation: cross5, leader: {mode: hover}}
+  S7_grid9_hover:   {formation: grid9,  leader: {mode: hover}}
+  S7_grid9_line:    {formation: grid9,  leader: {mode: line,   speed: 0.5, max_distance: 12.0, ready_hold: 30.0, ready_pos_err: 0.3},
+                     thresholds: {solve_ms: 15.0}}
+  S8_grid9_circle:  {formation: grid9,  leader: {mode: circle, speed: 0.5, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3},
+                     thresholds: {solve_ms: 15.0}, limits: {safety_max_track_dist: 25.0, w_collision: 200.0, alt_resync_enable: false, vel_xy_kp: 0.5, vel_xy_cap: 0.8, alt_trim_enable: true}}
+
+  # ── EXT（扫自变量，加强稳定性论证）──
+  S9_star5_line:    {formation: star5,  leader: {mode: line,   speed: 1.0, max_distance: 20.0}}
+
+  S10_cross5_line_fast:                     # 速度应力：看限幅边界
+    formation: cross5
+    leader: {mode: line, speed: 2.5, max_distance: 30.0}
+
+  S11_cross5_perturbed:                     # 出生点扰动：从打乱初值收敛(两两已 > d_safe)
+    formation: cross5
+    birth_override: [[1.0, 0.8, 0], [0.5, 3.4, 0], [-0.7, -2.6, 0],
+                     [3.5, -0.6, 0], [-3.5, -0.8, 0]]
+    # d4: (-2.8,+0.9)→(-3.5,-0.8): 旧值偏东与 d0 同 Y 侧，收敛+追踪期均易近撞；新值偏西南
+    leader: {mode: line, speed: 1.0, max_distance: 20.0, ready_hold: 30.0, ready_pos_err: 0.8}
+    limits:
+      safety_max_track_dist: 12.0         # 打乱出生→初始 track_err 大，放宽围栏
+      w_collision: 400.0                  # 加重碰撞软约束，防追踪超调期 d0/d4 近撞
+
+  S12_cross5_wide:                          # 加宽间距 3→5 m
+    formation: cross5
+    offsets_scale: 1.6667
+    leader: {mode: line, speed: 1.0, max_distance: 20.0}
+
+  S13_cross5_circle_10min:                  # 长时漂移
+    formation: cross5
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}
+    duration_s: 600
+
+  # ── 降级三件套（故障注入 / 保守限幅 / 阈值调参）──
+  S14_cross5_killnode:                      # 故障注入：稳定后杀 drone1，看降级悬停+间距
+    formation: cross5
+    leader: {mode: line, speed: 1.0, max_distance: 20.0}
+    faults: {kill_drone: 1, kill_at_s: 30}
+
+  S15_cross5_conservative:                  # 保守限幅：逼近真机参数
+    formation: cross5
+    leader: {mode: line, speed: 1.0, max_distance: 20.0}
+    limits: {max_speed: 1.5, max_accel: 2.0, d_safe: 2.5}
+    # 2026-07-17 复标定：保守 max_accel=2.0 下收敛显著慢于其他场景，210s 标准录制窗口
+    # 会在真正收敛前截断（pos_err 骤降发生在 t≈266s，之前一直是真实、单调、线性下降的
+    # 收敛尾段，不是发散）。450s 探测跑确认 t>270s 后稳定在 0.02–0.09m。
+    # 判定须用: duration_s>=350 + verdict.py --steady-offset 270（而非默认45）。
+    duration_s: 350
+
+  S16_cross5_commsdrop:                     # 通信劣化注入：邻居预测延时+丢包
+    formation: cross5
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}
+    faults: {comms_delay_ms: 200, comms_dropout: 0.2}
+
+  # ── pair2 / trio3 扰动 + 速度应力 ──────────────────────────────────────────
+  S17_pair2_perturbed:                      # 双机出生扰动
+    formation: pair2
+    birth_override: [[0.5, 0.3, 0], [-2.7, -0.4, 0]]
+    leader: {mode: line, speed: 0.5, max_distance: 20.0}
+
+  S18_pair2_wide:                           # 双机间距加宽 3→5 m
+    formation: pair2
+    offsets_scale: 1.6667
+    leader: {mode: line, speed: 0.5, max_distance: 20.0}
+
+  S19_trio3_perturbed:                      # 三机出生扰动（先成型再走圆周）
+    formation: trio3
+    birth_override: [[3.3, 0.5, 0], [-1.2, 2.8, 0], [-1.8, -2.3, 0]]
+    # ready_hold 20s: 三机静止悬停下把队形畸变收敛到位(pos_err<0.3)再开圆周，
+    # 消除入轨期"边追边成型"的畸变(实测入轨期畸变峰值8.8m)。
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    # w_formation 0.05: 圆周跟踪最优(越小越圆; 0.2会向心离心震荡)。失控由
+    # EKF reset cap(mpc_node)根治。
+    limits: {w_formation: 0.05}
+
+  S20_pair2_line_d10:                       # 双机直线 近目标 max_distance=10
+    formation: pair2
+    leader: {mode: line, speed: 0.5, max_distance: 10.0}
+
+  S21_pair2_line_d30:                       # 双机直线 远目标 max_distance=30
+    formation: pair2
+    leader: {mode: line, speed: 0.5, max_distance: 30.0}
+
+  S22_trio3_wide:                           # 三机间距加宽 3→5 m（offsets_scale=5/3≈1.6667）
+    formation: trio3
+    offsets_scale: 1.6667
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}
+
+  # ── 真机部署门槛（pair2/trio3 的 P2 三件套，对应 S14–S16 的 cross5 版）──────
+  # killnode 判定依据(2026-07-14, c2e7759)：被杀机 mpc 静默但其 PX4 仍发位置时，
+  # 幸存机对它的编队项 d_star 动态置为当前距离(失效化)——修复前编队项把幸存机拽向
+  # 趴窝机形成恒定偏差(S23 0.8m / S24 圆周振荡 0↔1.5m)。修复后预期幸存机 pos_err
+  # 正常(<0.5)；若复发,先查 launch 日志 formation-neutral 是否触发。
+  S23_pair2_killnode:                       # 双机杀一机：剩余机应稳定悬停不受扰
+    formation: pair2
+    leader: {mode: line, speed: 0.5, max_distance: 20.0}
+    faults: {kill_drone: 1, kill_at_s: 30}
+
+  S24_trio3_killnode:                       # 三机圆周中杀一机：余两机维持跟踪+间距
+    formation: trio3
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    faults: {kill_drone: 1, kill_at_s: 45}
+
+  S25_trio3_commsdrop:                      # 三机通信劣化：200ms 延迟 + 20% 丢包
+    formation: trio3
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    faults: {comms_delay_ms: 200, comms_dropout: 0.2}
+
+  S26_trio3_conservative:                   # 三机保守限幅：逼近真机参数
+    formation: trio3
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    limits: {max_speed: 1.5, max_accel: 2.0, d_safe: 2.5}
+
+  # ── S42/S43：突发通信中断（补 S25 的盲区，2026-07-22 新增）──────────────────
+  # S25(200ms 延迟 + 20% i.i.d. 丢包)**从未真正触发 neighbour_timeout 降级**：
+  # 20% 丢包下连续丢满 2s(50Hz→100 条)的概率约 1e-70。而真实 2.4G 无线的典型
+  # 失效是遮挡/干扰造成的**突发中断**（连续断数百 ms~数秒后恢复），与 i.i.d.
+  # 稀疏丢包是两回事。这两条专测「降级进得去、恢复出得来」。
+  # blackout 时间基准 = 节点启动时刻 → start_s 须覆盖 leader start_delay(30s)+起飞收敛。
+  S42_trio3_commsblackout:                  # 断 3s / 每 15s 一次（> neighbour_timeout=2s）
+    formation: trio3
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    duration_s: 240
+    faults: {comms_blackout_duration_s: 3.0, comms_blackout_period_s: 15.0,
+             comms_blackout_start_s: 90.0}
+
+  S43_trio3_commsblackout_long:             # 断 6s / 每 30s 一次：探中断时长上限
+    formation: trio3
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    duration_s: 300
+    faults: {comms_blackout_duration_s: 6.0, comms_blackout_period_s: 30.0,
+             comms_blackout_start_s: 90.0}
+
+  # S44：**大包选择性丢失**（scope=pred，只断预测、位置/health 照常）。
+  # 这是无线劣化的典型形态（预测 ~800-1000B 比位置 ~100-200B 更易丢），也是
+  # 趴窝误判的触发条件：旧判据("预测过期+位置新鲜")会把它当成队友 mpc 崩溃、
+  # 关掉编队项。2026-07-22 实测旧版误触发 81 次；加 health 门后应降为 0。
+  S44_trio3_predloss:
+    formation: trio3
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    duration_s: 240
+    faults: {comms_blackout_duration_s: 3.0, comms_blackout_period_s: 15.0,
+             comms_blackout_start_s: 90.0, comms_blackout_scope: pred}
+
+  # S45：**差模扰动 + 断连**（killnode 叠加 blackout）—— 这是 S42/S43 测不到的那半边。
+  # S42 断连影响仅 +0.01m、叠加风后 +0.000m，因为那些扰动都是**共模**的（三机同向
+  # 偏移、相对队形不变），"邻居在队形位上"这个 L3 推断依然≈真值。
+  # 本场景制造**差模**：t=45s 杀 drone1 的 mpc → PX4 接管、它趴在原地脱离队形，
+  # 而幸存机绕圆周(周期≈63s)每圈都会经过它附近。断连期间幸存机对它走 L3，
+  # 推断它"还在队形位上"——**碰撞规避正是基于这个错误位置工作的**。
+  # 对照基线：S24 同参数无 blackout，min_spacing 最小 4.417m（2026-07-22 实测）。
+  S45_trio3_killnode_blackout:
+    formation: trio3
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center,
+             ready_hold: 20.0, ready_pos_err: 0.3}
+    duration_s: 240
+    # ⚠️ kill_at_s 必须**晚于编队就绪**：就绪门控要求全员 pos_err<0.3 保持 20s，
+    # 杀早了永远凑不齐 → 门控超时、整个 trial 被脚本丢弃（2026-07-22 用 45s 实测踩到；
+    # S24 能过只是它那次起飞恰好够快）。这里排成 90s 断连 → 100s 杀节点，
+    # 先看纯断连、再看断连+趴窝的演进。
+    faults: {kill_drone: 1, kill_at_s: 100,
+             comms_blackout_duration_s: 3.0, comms_blackout_period_s: 15.0,
+             comms_blackout_start_s: 90.0, comms_blackout_scope: all}
+
+  # ══ S27+ safety_filter SITL 回归·诱发场景（真机门禁，配套 report/safety_filter_SITL回归清单.md）══
+  # 共性说明：
+  #  · 诱发类场景 verdict 预期不按常规 PASS 判（thresholds 已放宽），判定以节点日志
+  #    `SAFETY <state> <reasons>` + analyze_flight 轨迹为准；清单里写了每场景的预期日志。
+  #  · safety_* 参数在 mpc_node 构造时读一次 → 改本文件后必须 colcon build 才生效。
+  #  · ⚠️ 碰撞地板检查不受 grace 门控：诱发碰撞保护时 d_emergency/d_warn 必须 < 出生间距，
+  #    否则飞机在地面就 HOLD→RELINQUISH、起飞锁死（清单原“抬 d_emergency 到 5.5”法不可用，
+  #    这里改用 offsets_scale 缩小空中队形目标制造真实接近）。
+
+  S27_solo1_fence_line:                     # 飞散围栏·追线诱发（Phase1 第1行）
+    formation: solo1
+    leader: {mode: line, speed: 1.0, max_distance: 20.0, yaw_mode: tangent}
+    # 0.3m 压到稳态滞后以下保证触发。追线时机头速度指向参考点(v_out<0)，按 safety_filter
+    # 代码只会给 severity1 → 预期停在 DEGRADED 半速追、不升级 RELINQUISH；
+    # 预期日志: flyaway_near/flyaway_converging + SAFETY DEGRADED；leader 到头停走后
+    # 应观察到 ok_streak 达 clear_frames 回 NORMAL（迟滞降级闭环）。
+    limits: {safety_max_track_dist: 0.3}
+    thresholds: {pos_err: 99.0, total_fallbacks: 99999}
+    criteria: log      # 定案看节点日志 SAFETY 状态链，非 CSV 阈值
+
+  S28_solo1_fence_circle:                   # 飞散围栏·圆周诱发（径向滞后触 breach 刹车）
+    formation: solo1
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}
+    # 圆周入轨/跟踪径向滞后远超 1m（S0 同场景须放围栏到 15 才不触发）→ 必然越界；
+    # 圆周中 v_out 周期性 >0 → 预期日志: flyaway_breach(刹外扩分量) 混 flyaway_converging，
+    # 可能间歇 HOLD。观察轨迹被“拽住”不外飞。
+    limits: {safety_max_track_dist: 1.0}
+    thresholds: {pos_err: 99.0, total_fallbacks: 99999}
+    criteria: log      # 定案看节点日志 SAFETY 状态链，非 CSV 阈值
+
+  S29_trio3_squeeze_warn:                   # 碰撞地板·真实接近（d_warn 带内均衡，Phase1 第3行）
+    formation: trio3
+    leader: {mode: hover}
+    # 出生间距不变(5.196m，起飞不锁死)；空中队形目标缩到 5.196*0.35≈1.82m，
+    # 落在 d_warn=2.0 与 d_emergency=1.2 之间 → 持续 collide_warn 抑制接近+排斥。
+    # 预期: 均衡间距 ≈ d_warn 附近(1.9~2.1m)，min spacing 全程 > d_emergency=1.2，
+    # 无 collide_emerg 日志；状态 DEGRADED 持续（severity1）。
+    offsets_scale: 0.35
+    thresholds: {min_spacing: 1.3, pos_err: 99.0, total_fallbacks: 99999}
+    criteria: log      # 定案看节点日志 SAFETY 状态链，非 CSV 阈值
+
+  S30_trio3_squeeze_emerg:                  # 碰撞地板·emerg 全停 + 多机同时 RELINQUISH（Phase1 第2行替代法 + Phase2 互不连累）
+    formation: trio3
+    leader: {mode: hover}
+    # d_emergency 抬到 2.2（< 出生间距 5.196 不锁死；> 队形目标 1.82 必触发）→ d_warn=2.7。
+    # 预期: 收敛进 2.7 先 collide_warn，进 2.2 collide_emerg 横向全停(severity2)
+    # → HOLD → ~1s → RELINQUISH（三机可能同时）。min spacing 冻结在 ≈2.1~2.2，绝不 <1.9。
+    # 顺带观察: 多机 RELINQUISH 互不连累 + PX4 是否接管（同 S31 的链路问题）。
+    offsets_scale: 0.35
+    limits: {safety_d_emergency: 2.2}
+    thresholds: {min_spacing: 1.9, pos_err: 99.0, total_fallbacks: 99999}
+    criteria: log      # 定案看节点日志 SAFETY 状态链，非 CSV 阈值
+
+  S31_solo1_relinquish_alt:                 # 🔴 RELINQUISH→PX4 接管链·确定性诱发（放飞门槛第3条）
+    formation: solo1
+    # 本场景**故意**让 target_alt 越过 safety_max_alt（见下），故豁免
+    # tools/check_scenario_envelope.py 的包络检查，否则该工具会有已知误报。
+    envelope_check: false
+    leader: {mode: hover}
+    # max_alt=3.0 < target_alt=5.0 → 爬升越 3m 后 fence_alt_high 压帽(severity2 持续)
+    # → HOLD(零速悬停~3m) → 1s → RELINQUISH 停发 setpoint。
+    # ⚠️ 前提: 先按 report/真机安全配置清单_FC.md 在 SITL PX4 配 COM_OF_LOSS_T/COM_OBL_RC_ACT，
+    #    QGC 肉眼确认 PX4 切 Hold/Land —— 这一步是清单头号门禁。
+    # ✅ 已定案(2026-07-14 reg_lag_20260713 批次日志取证): 方案b(d1fab29)实测打通——
+    #    RELINQUISH 后 nav_state 14(OFFBOARD)→4(AUTO_LOITER) 稳定保持到场景结束，
+    #    "重发 DO_SET_MODE" 日志零次出现(=PX4 首条指令即接管成功)，停流彻底。
+    #    旧预判(2026-07-03"心跳不停→COM_OF_LOSS_T 不触发")对应的隐患已由方案b消除。
+    #    另: RELINQUISH 跨架次解闩见 mpc_node._on_vehicle_status(disarmed→armed 边沿 reset)。
+    limits: {safety_max_alt: 3.0}
+    thresholds: {pos_err: 99.0, total_fallbacks: 99999}
+    criteria: log      # 定案看节点日志 SAFETY 状态链，非 CSV 阈值
+
+  S32_solo1_circle_nosafety:                # Phase0 A/B 基线：safety 关，与 S0_solo1_circle 对比
+    formation: solo1
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}
+    limits: {safety_filter_enable: false}
+
+  S_solo1_circle_nosafety_s1:               # 单机风扰基线(论文 §5.5 单机锚点)：与 S34 cross5
+    formation: solo1                        # 完全同参(圆周 speed 1.0/radius 10/nosafety)、仅单机。
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center}
+    limits: {safety_filter_enable: false}   # legacy 用 tau:=0.0、fix 用默认 0.5。用于判"~120m
+    # 发散是单机滞后本身还是队形放大"：solo1 legacy 若也 ~120m ⇒ 单机滞后主导、耦合放大有限。
+
+  S33_trio3_circle_nosafety:                # Phase0 A/B 基线：safety 关，与 S3_trio3_circle 对比
+    formation: trio3
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center}
+    limits: {safety_filter_enable: false}
+
+  S34_cross5_circle_nosafety:               # 风扰对照(W 系)：与 S5 完全同参、仅关 safety——
+    formation: cross5                       # 分离"MPC 本体抗风"与"围栏对风扰的级联误杀"两个效应。
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, w_collision: 500.0, vel_lag_tau: 0.0}  # legacy A 基线：默认转 0.5 后须显式钉 0
+    # 风扰本身在 Gazebo 侧注入（ApplyLinkWrench 持续 wrench，见报告 §5.F 复现命令），yaml 不编码。
+
+  S38_cross5_circle_nocouple:               # 审稿意见 M1/M2（2026-08-17）：完全解耦对照。
+    formation: cross5                       # 与 S34 同参，但**同时**关掉显式队形项与碰撞项 ⇒ 五架机
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, w_collision: 0.0, w_formation: 0.0, vel_lag_tau: 0.0}
+    # 之间只剩"共享领队参考 + 共同世界系"这一层隐式耦合。用来把 §6.2c 的放大来源再切一刀：
+    #   solo1(49m) → 本场景(?) → w_f=0 但 w_c=500(102m 按机) → w_f=0.5(101m 按机)
+    # 若本场景 ≈ solo1 ⇒ 放大来自碰撞项；若 ≈ 102 ⇒ 来自共享参考。风扰同 S34，在 Gazebo 侧注入。
+
+  S35_cross5_circle_nosafety_vmax5:         # 实验1(2026-07-09)：与 S34 完全同参，仅 max_speed 3.0→5.0。
+    formation: cross5                       # 用于判别"速度饱和"是否为风扰大幅振荡的成因。
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, w_collision: 500.0, max_speed: 5.0, vel_lag_tau: 0.0}  # legacy A 基线，同上
+    # 结论：幅值与周期均 ∝ vmax（峰峰 ×1.70 vs vmax ×1.67）→ 饱和是"兜住"发散而非制造它。见 §5.G。
+
+  S37_trio3_circle_rh_lag:                   # 实验5(2026-07-09)：与 S3_trio3_circle_rh 完全同参，仅 vel_lag_tau 0→0.5。
+    formation: trio3                        # 验证"圆周相位滞后"是否同源于权限幻觉（§5.G）。无风；safety_filter 默认开。
+    leader: {mode: circle, speed: 1.5, radius: 10.0, yaw_mode: center, ready_hold: 20.0, ready_pos_err: 0.3}
+    limits: {vel_lag_tau: 0.5}
+
+  S36_cross5_circle_nosafety_lag:           # 实验4(2026-07-09)：与 S34 完全同参，仅 vel_lag_tau 0→0.5。
+    formation: cross5                       # 接口一致 MPC：模型 v̇=(v_sp−v)/τ，直接下发 u0。见 §5.G。
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, w_collision: 500.0, vel_lag_tau: 0.5}
+    # 改 vel_lag_tau 会改变 OCP 结构 → 必须 `rm -rf ~/.cache/mpc_control/acados_di_mpc_* /tmp/acados_di_mpc_*`。
+
+  # ── 拓扑放大排序实验（2026-07-16，验证论文 §5.6 阻尼裕度公式 ζ(τ,λ) 给出的排序预测：
+  #    trio3(λmax=3) < star5(λmax=3.618) < cross5(λmax=5) < grid9(λmax=6)，
+  #    预测同等风扰下发散/振荡严重程度按此顺序递增。cross5 复用 S34/S36 现成数据，
+  #    trio3 复用 S33（run_one_trial.sh 用 --tau 覆盖为 0.0/0.5，与 S34/S36 一致）。
+  #    这两条 star5/grid9 是本次新增，与 S34 逐字同构（仅 formation 不同），供
+  #    run_one_trial.sh 以相同 wind_N/wind_delay 协议驱动 ──
+  S_star5_circle_nosafety:
+    formation: star5
+    leader: {mode: circle, speed: 1.0, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, vel_lag_tau: 0.0}
+
+  S_grid9_circle_nosafety:
+    formation: grid9
+    leader: {mode: circle, speed: 0.5, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, vel_lag_tau: 0.0}
+
+  # ── 拓扑排序规范对照实验（2026-07-16 第二轮）：上面那批 n=2 快速测试里 leader 速度
+  #    跨编队未统一(1.5/1.0/1.0/0.5)是个真实混杂因素，排序没吻合理论预测。这四条
+  #    _v05 场景把 speed 统一钉死在 0.5(=grid9 原有惯例，四个编队都测过、偏安全)，
+  #    duration/wind协议也统一(300s，wind_N=2.0 @ t=100s)，供 n≥5 规范对照跑。
+  S_trio3_circle_nosafety_v05:
+    formation: trio3
+    leader: {mode: circle, speed: 0.5, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, vel_lag_tau: 0.0}
+
+  S_cross5_circle_nosafety_v05:
+    formation: cross5
+    leader: {mode: circle, speed: 0.5, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, w_collision: 500.0, vel_lag_tau: 0.0}
+
+  # 2026-08-18：与上面 v05 逐字相同，只把 w_collision 降回 defaults 的 200（= trio3/star5/
+  # grid9 的 v05 用的值）。上面那条自引入起就带 500，使 §5.6 的"四拓扑受控对比"实际上
+  # 不只差拓扑；本条用于把扫描真正配平。两条并存，别删上面那条（已发表数据出自它）。
+  S_cross5_circle_nosafety_v05_wc200:
+    formation: cross5
+    leader: {mode: circle, speed: 0.5, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, vel_lag_tau: 0.0}
+
+  S_star5_circle_nosafety_v05:
+    formation: star5
+    leader: {mode: circle, speed: 0.5, radius: 10.0, yaw_mode: center, ready_hold: 30.0, ready_pos_err: 0.3}
+    limits: {safety_filter_enable: false, vel_lag_tau: 0.0}
+
+  # ── 回归子集 B 组（2026-07-09）：与左侧 A 组基线逐字同参，仅 vel_lag_tau 0→0.5 ──
+  # 覆盖 exp4/exp5 未触及的失效模式：静态保持、轴向梯形减速(bug#13)、9 机求解预算、
+  # 打乱出生点的大机动收敛(唯一可能绑定 §5.G③ 逐轴箱 vs 范数限幅的工况)。
+  # ⚠ 2026-07-14 默认已转 0.5：本组的显式 vel_lag_tau: 0.5 变为冗余（无害，保留作文档）；
+  #   对应 A 组基线（S6/S7/S4/S11 等主回归场景）自此也走 0.5——复现 legacy 行为须显式传 0.0。
+  S38_cross5_hover_lag:      {formation: cross5, leader: {mode: hover}, limits: {vel_lag_tau: 0.5}}   # ↔ S6
+  S39_grid9_hover_lag:       {formation: grid9,  leader: {mode: hover}, limits: {vel_lag_tau: 0.5}}   # ↔ S7
+  S40_cross5_line_lag:       {formation: cross5,                                                       # ↔ S4
+    leader: {mode: line, speed: 1.0, max_distance: 20.0, ready_hold: 30.0, ready_pos_err: 0.3},
+    limits: {vel_lag_tau: 0.5}}
+  S41_cross5_perturbed_lag:                                                                            # ↔ S11
+    formation: cross5
+    birth_override: [[1.0, 0.8, 0], [0.5, 3.4, 0], [-0.7, -2.6, 0],
+                     [3.5, -0.6, 0], [-3.5, -0.8, 0]]
+    leader: {mode: line, speed: 1.0, max_distance: 20.0, ready_hold: 30.0, ready_pos_err: 0.8}
+    limits:
+      safety_max_track_dist: 12.0
+      w_collision: 400.0
+      vel_lag_tau: 0.5
+
+# ── 默认判定阈值（verdict.py 用；scenario.thresholds 可逐项覆盖）──────────────
+thresholds:
+  min_spacing:        1.8     # 全程最小间距 > 1.8 m（< d_safe=1.5 为危险）
+  pos_err:            0.5     # 成型后各机跟踪误差 < 0.5 m
+  solve_ms:          12.0     # 单帧最大求解 < 12 ms（grid9 放宽 15）
+  safety_violations:    0     # 间距 < 1.5 m 累计帧 = 0
+  total_fallbacks:      0     # 降级悬停累计 = 0
